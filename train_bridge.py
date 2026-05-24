@@ -19,7 +19,7 @@ from timm.utils import ModelEma
 import torch.utils
 from LaBraM_anonymous.optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
 import LaBraM_anonymous.modeling_finetune
-from LaBraM_anonymous.engine_for_finetuning import evaluate
+#from LaBraM_anonymous.engine_for_finetuning import evaluate
 from utils import evaluate_bridge, fm_forward, create_forward_pre_hook, fm_input_hook, fm_output_hook, fm_lastlayer_output_hook
 from utils import labram_data_prepare, hubertecg_data_prepare, hubertecgb_data_prepare, hubertecgl_data_prepare, ecgfm_data_prepare, papagei_data_prepare, ecgdualnet_data_prepare
 from utils import labram_forward, hubertecg_forward, hubertecgb_forward, hubertecgl_forward, ecgfm_forward, papagei_forward, ecgdualnet_forward
@@ -34,6 +34,7 @@ from ECG_Classification_anonymous.ecg_classification.config import ECGAttNet_CON
 from ECG_Classification_anonymous.ecg_classification.model import ECGAttNet
 from NormWear_anonymous.main_model import NormWearModel
 import utils
+from device_utils import get_device
 from scipy import interpolate
 import shutil
 import matplotlib.pyplot as plt
@@ -42,13 +43,15 @@ import torch.optim as optim
 import math
 import datetime
 from torch.utils.tensorboard import SummaryWriter
-import mlflow
+writer = SummaryWriter(log_dir="runs/bridge_experiment")
+# import mlflow
 import sys
 import torch.nn.functional as F
 from einops import rearrange
 from functools import partial
 import re
-from utils import CorrelationLoss, plot_confusion_matrix, plot_bridge_error_distribution
+#from utils import CorrelationLoss, plot_bridge_error_distribution
+from utils import plot_confusion_matrix
 from collections import defaultdict
 
 loss_functions = {
@@ -90,21 +93,26 @@ def get_args():
     parser.add_argument('--linear_probe_input_dim_reduction', type=str, help='How to reduce dimension of FM output before feeding into the linear prober')
     parser.add_argument('--train_size', type=float, default=100, help='Percentage of training data to use')
     parser.add_argument('--mode', type=str, choices=['evaluate', 'train', 'linear_probe_fm_new', 'store_features'])
+    parser.add_argument('--device', type=str, default="cpu",choices=["cpu", "gpu"], help='Use GPU only if available')
     parser.add_argument('--debug_run', action='store_true', help='Break training and evaluation loops early to go through the entire code before running')
     return parser.parse_args()
 
+# Ensure that code works with/without GPU and load checkpoint to relevant device (instead of GPU only)
+def load_checkpoint(path, device):
+    return torch.load(path, map_location=device)
+
 # mlflow Logging
-def log_mlflow(args, stats, split, step):
-    for metric in args.metrics:
-        mlflow.log_metric(f"{metric}/{split}", stats[metric], step=step)
-    if args.mode in ['train', 'evaluate']:
-        mlflow.log_metric(f"loss_logits/{split}", stats['loss_logits'], step=step)
-        mlflow.log_metric(f"loss_bridge/{split}", stats['loss_bridge'], step=step)
-    elif args.mode in ['linear_probe_fm_new', 'check_before_train']:
-        mlflow.log_metric(f"loss_logits/{split}", stats['loss_logits'], step=step)
-    mlflow.log_figure(plot_confusion_matrix(stats['cm_percent'], stats['cm_percent'].index, title='Confusion Matrix (Percentage)'), f"cm_percent/{split}_epoch_{str(step).zfill(4)}.png")
-    mlflow.log_figure(plot_confusion_matrix(stats['cm_abs'], stats['cm_abs'].index, title='Confusion Matrix (Absolute)'), f"cm_abs/{split}_epoch_{str(step).zfill(4)}.png")
-    return None
+#def log_mlflow(args, stats, split, step):
+#    for metric in args.metrics:
+#        mlflow.log_metric(f"{metric}/{split}", stats[metric], step=step)
+#    if args.mode in ['train', 'evaluate']:
+#        mlflow.log_metric(f"loss_logits/{split}", stats['loss_logits'], step=step)
+#        mlflow.log_metric(f"loss_bridge/{split}", stats['loss_bridge'], step=step)
+#    elif args.mode in ['linear_probe_fm_new', 'check_before_train']:
+#        mlflow.log_metric(f"loss_logits/{split}", stats['loss_logits'], step=step)
+#    mlflow.log_figure(plot_confusion_matrix(stats['cm_percent'], stats['cm_percent'].index, title='Confusion Matrix (Percentage)'), f"cm_percent/{split}_epoch_{str(step).zfill(4)}.png")
+#    mlflow.log_figure(plot_confusion_matrix(stats['cm_abs'], stats['cm_abs'].index, title='Confusion Matrix (Absolute)'), f"cm_abs/{split}_epoch_{str(step).zfill(4)}.png")
+#    return None
 
 # Loading LaBraM checkpoint
 def load_labram(args, checkpoint_path):
@@ -199,6 +207,7 @@ def load_hubertecg(args, checkpoint_path):
     config = checkpoint["model_config"]
     fm = HuBERTECG(config)
     load_result = fm.load_state_dict(renamed_state_dict, strict=False)
+
     # Report missing and unexpected keys
     if load_result.missing_keys:
         print("Missing keys:")
@@ -326,24 +335,26 @@ def main(args):
 
     # Set seed
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    np.random.seed(args.seed)   
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
     # Define device
-    device = torch.device('cuda')
+    device = get_device(args.device)
 
     # Print arguments
     print(f'Experiment arguments: {args}')
 
     # mlflow Logger
-    mlflow.set_experiment(args.experiment_name)
-    mlflow.start_run(run_name=f"{str(args.experiment_number).zfill(3)}_{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
-    mlflow.log_params(vars(args)) # log all the hyperparameters
-    if args.debug_run:
-        mlflow.set_tag("debug_run", "True")
+    #mlflow.set_experiment(args.experiment_name)
+    #mlflow.start_run(run_name=f"{str(args.experiment_number).zfill(3)}_{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")
+    #mlflow.log_params(vars(args)) # log all the hyperparameters
+    #if args.debug_run:
+     #   mlflow.set_tag("debug_run", "True")
 
     # Get dataset and define the associated variables
     train_files = os.listdir(os.path.join(args.data_dir, "train"))
@@ -383,6 +394,19 @@ def main(args):
         val_dataset = utils.FOGLoader(os.path.join(args.data_dir, "val"), val_files, data_order)
         test_dataset = utils.FOGLoader(os.path.join(args.data_dir, "test"), test_files, data_order)
         pair_dataset = utils.FOGLoader(os.path.join(args.data_dir, "pair"), pair_files, data_order, percentage=args.train_size)
+    elif 'DALIA' in args.data_dir:
+        if args.fm_old in ['papagei'] and args.fm_new in ['ecgfm', 'hubertecg', 'hubertecgb', 'hubertecgl', 'ecgdualnet']:
+            data_order = 'ppgecglabel'
+        elif args.fm_old in ['ecgfm', 'hubertecg', 'hubertecgb', 'hubertecgl', 'ecgdualnet'] and args.fm_new in ['papagei']:
+            data_order = 'ecgppglabel'
+        else:
+            raise ValueError("Invalid FM combination")
+        # Use the same loader as for WESAD, because the modalities are the same (ECG and PPG)
+        train_dataset = utils.WESADLoader(os.path.join(args.data_dir, "train"), train_files, data_order)
+        val_dataset = utils.WESADLoader(os.path.join(args.data_dir, "val"), val_files, data_order)
+        test_dataset = utils.WESADLoader(os.path.join(args.data_dir, "test"), test_files, data_order)
+        pair_dataset = utils.WESADLoader(os.path.join(args.data_dir, "pair"), pair_files, data_order, percentage=args.train_size)
+
     sampler_train = torch.utils.data.RandomSampler(train_dataset)
     sampler_val = torch.utils.data.SequentialSampler(val_dataset)
     sampler_test = torch.utils.data.SequentialSampler(test_dataset)
@@ -421,23 +445,46 @@ def main(args):
     args.nb_classes = int(re.search(r'(\d+)classes', args.data_dir).group(1))
     # Define metrics
     args.metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted", "f1_macro"]
-    
+
     # Load FM from old modality
     print(f'Loading FM from old modality')
+    print("\n=== FM_OLD CHECKPOINT INFO ===")
+    print("fm_old checkpoint:", args.fm_old_checkpoint)
+    print("Checkpoint exists:", os.path.exists(args.fm_old_checkpoint))
     fm_old = globals()[f"load_{args.fm_old}"](args=args, checkpoint_path=args.fm_old_checkpoint)
     fm_old.to(device)
     print(f"FM from old modality loaded, with architecture: {str(fm_old)}")
 
+    first_param_old = next(fm_old.parameters())
+
+    print("\n=== FM_OLD WEIGHT STATS ===")
+    print("mean:", first_param_old.data.mean().item())
+    print("std:", first_param_old.data.std().item())
+    print("min:", first_param_old.data.min().item())
+    print("max:", first_param_old.data.max().item())
+
     # Load FM from new modality
     print(f'Loading FM from new modality')
+    print("\n=== FM_NEW CHECKPOINT INFO ===")
+    print("fm_new checkpoint:", args.fm_new_checkpoint)
+    print("Checkpoint exists:", os.path.exists(args.fm_new_checkpoint))
+
     fm_new = globals()[f"load_{args.fm_new}"](args=args, checkpoint_path=args.fm_new_checkpoint)
     fm_new.to(device)
     print(f"FM from new modality loaded, with architecture: {str(fm_new)}")
 
+    first_param = next(fm_new.parameters())
+
+    print("\n=== MODEL WEIGHT STATS ===")
+    print("mean:", first_param.data.mean().item())
+    print("std:", first_param.data.std().item())
+    print("min:", first_param.data.min().item())
+    print("max:", first_param.data.max().item())
+
     # Load linear prober weights for FM from old modality
     if args.mode in ['train', 'evaluate', 'store_features']:
         prober_checkpoint_path = re.sub(r"(\d{3})\.pth$", r"\1_linear_prober.pth", args.fm_old_checkpoint)
-        prober_checkpoint = torch.load(prober_checkpoint_path)
+        prober_checkpoint = load_checkpoint(prober_checkpoint_path, device)
         prober_size = prober_checkpoint['linear_prober_state_dict']['weight'].shape
         linear_prober = nn.Linear(prober_size[1], prober_size[0]).to(device)
         linear_prober.load_state_dict(prober_checkpoint['linear_prober_state_dict'])
@@ -541,6 +588,9 @@ def main(args):
                     args.bridge_output_dim = 512*46
                 elif 'WESAD' in args.data_dir:
                     args.bridge_output_dim = 512*93
+                elif 'DALIA' in args.data_dir:
+                    print("DALIA")
+                    args.bridge_output_dim = 512*93
             elif 'linear_prober' in args.bridge_output_location:
                 args.bridge_output_dim = 512
         elif args.fm_old in ['hubertecgb']:
@@ -617,6 +667,9 @@ def main(args):
                 args.num_tokens = 46
             elif 'WESAD' in args.data_dir:
                 args.num_tokens = 93
+            elif 'DALIA' in args.data_dir:
+                print("DALIA 2")
+                args.num_tokens = 93
         elif args.fm_old in ['hubertecgb']: 
             args.out_features = 768
             if 'ISRUC' in args.data_dir:
@@ -657,7 +710,7 @@ def main(args):
         # Load the bridge if evaluate
         if args.mode in ['evaluate']:
             checkpoint_path = os.path.join(args.output_dir, f'{str(args.epoch).zfill(3)}.pth')
-            checkpoint_pt = torch.load(checkpoint_path)
+            checkpoint_pt = load_checkpoint(checkpoint_path, device)
             bridge_load_result = bridge_model.load_state_dict(checkpoint_pt['model_state_dict'])
             print('Bridge loading', bridge_load_result)
 
@@ -698,7 +751,9 @@ def main(args):
     
     # Set fm to eval mode
     fm_old.eval()
+    print("Model training mode 1:", fm_old.training)
     fm_new.eval()
+    print("Model training mode:2", fm_new.training)
     
     # Train the bridge
     if args.mode in ['train']:
@@ -768,7 +823,6 @@ def main(args):
                     # Forward for FMs
                     with torch.no_grad():
                         fm_old_input, fm_new_output, fm_old_lastlayer_output = fm_forward(fm_old=fm_old, fm_new=fm_new, data_old=data_old, data_new=data_new, messenger=messenger, args=args)
-                    
                     fm_old_input_list.append(fm_old_input)
                 fm_old_input_all = torch.cat(fm_old_input_list, dim=0)
                 assert fm_old_input.shape[-1] == args.out_features
@@ -779,7 +833,8 @@ def main(args):
             # Load the shuffled prototypes
             shuffled_prototypes = np.load(shuffled_prototypes_path)
             bridge_model.initialize_prototypes(shuffled_prototypes[:int(args.bridge_proto_init.split("_")[1]),:].T)
-            torch.cuda.empty_cache()
+            if device.type =='cuda':
+                torch.cuda.empty_cache()
 
         # Iterate through the epochs
         for e in range(args.epoch):
@@ -800,13 +855,14 @@ def main(args):
                 # Forward for FMs
                 with torch.no_grad():
                     fm_old_input, fm_new_output, fm_old_lastlayer_output = fm_forward(fm_old=fm_old, fm_new=fm_new, data_old=data_old, data_new=data_new, messenger=messenger, args=args)
-
+                
                 # Compute bridge features from new features
                 if args.bridge_input_dim_reduction in ['mean']:
                     if step == 0: # only calculate the dimension to reduce at the first step
                         dims_to_reduce = [i for i, dim in enumerate(fm_new_output.shape) if dim != current_batch_size and dim != args.bridge_input_dim]
-                    fm_new_output = torch.mean(fm_new_output, dim=tuple(dims_to_reduce))
+                    fm_new_output = torch.mean(fm_new_output, dim=tuple(dims_to_reduce))                
                 bridge_output = bridge_model(fm_new_output.view(current_batch_size,-1))
+
 
                 # Change the features to the target shape of fm_old intermediate input
                 if args.fm_old in ['labram']:
@@ -830,9 +886,9 @@ def main(args):
                             bridge_output = bridge_output.reshape(current_batch_size * 3, 560, 768)
                     elif 'linear_prober' in args.bridge_output_location:
                         bridge_output = bridge_output.view(current_batch_size, 768)
-                # # Optional debug
-                # print(f'fm_old_input and fm_new_output collected')
-                # print(f'fm_old_input: {fm_old_input.shape}, fm_new_output: {fm_new_output.shape}')
+                # Optional debug
+                #print(f'fm_old_input and fm_new_output collected')
+                #print(f'fm_old_input: {fm_old_input.shape}, fm_new_output: {fm_new_output.shape}')
 
                 # Calculate bridge loss
                 if args.bridge_criterion_location in ['bridge_output']:
@@ -853,6 +909,7 @@ def main(args):
                         )
                         messenger = eval(f"{args.fm_old}_forward")(fm=fm_old, data=data_old, messenger=messenger)
                         fm_old_lastlayer_output_pred = messenger['fm_lastlayer_output']
+                        
                         hook_handle.remove()
                         # Reshape for normwear
                         if args.fm_old in ['normwear']:
@@ -880,7 +937,7 @@ def main(args):
                 optimizer.step()
 
                 # Record loss
-                mlflow.log_metric("loss_bridge_iter", loss_bridge.item(), step=e*len(data_loader_train)+step)
+                #mlflow.log_metric("loss_bridge_iter", loss_bridge.item(), step=e*len(data_loader_train)+step)
 
                 # Optional testrun debug
                 if args.debug_run and step == 2:
@@ -891,13 +948,13 @@ def main(args):
                 with torch.no_grad():
                     bridge_model.eval()
                     stats = evaluate_bridge(args=args, data_loader=data_loader_train, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='train', step=e)
+                    #log_mlflow(args=args, stats=stats, split='train', step=e)
                     print(f"Model at epoch {e} on train set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
                     stats = evaluate_bridge(args=args, data_loader=data_loader_val, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='val', step=e)
+                    #log_mlflow(args=args, stats=stats, split='val', step=e)
                     print(f"Model at epoch {e} on val set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
                     stats = evaluate_bridge(args=args, data_loader=data_loader_test, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='test', step=e)
+                    #log_mlflow(args=args, stats=stats, split='test', step=e)
                     print(f"Model at epoch {e} on test set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
                         
                     print(f'Model trained for {e} epoch')
@@ -955,15 +1012,17 @@ def main(args):
         # Evaluate the bridge
         with torch.no_grad():
             bridge_model.eval()
-            # stats = evaluate_bridge(args=args, data_loader=data_loader_train, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
+            stats = evaluate_bridge(args=args, data_loader=data_loader_train, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
             # log_mlflow(args=args, stats=stats, split='train', step=args.epoch)
-            # print(f"Model at epoch {args.epoch} on train set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
-            # stats = evaluate_bridge(args=args, data_loader=data_loader_val, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
+            print(f"Model at epoch {args.epoch} on train set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
+            stats = evaluate_bridge(args=args, data_loader=data_loader_val, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
             # log_mlflow(args=args, stats=stats, split='val', step=args.epoch)
-            # print(f"Model at epoch {args.epoch} on val set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
+            print(f"Model at epoch {args.epoch} on val set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
             stats = evaluate_bridge(args=args, data_loader=data_loader_test, bridge_criterion=bridge_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=bridge_model, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-            log_mlflow(args=args, stats=stats, split='test', step=args.epoch)
+            #log_mlflow(args=args, stats=stats, split='test', step=args.epoch)
             print(f"Model at epoch {args.epoch} on test set: Loss_bridge {stats['loss_bridge']} Accuracy {stats['accuracy']}")
+            # print all results
+            print(stats)
     # Linear probing for fm_new
     elif args.mode in ['linear_probe_fm_new']:
         # Create hooks
@@ -1055,6 +1114,7 @@ def main(args):
 
                 # Forward for FMs
                 fm_old_input, fm_new_output, fm_old_lastlayer_output = fm_forward(fm_old=None, fm_new=fm_new, data_old=None, data_new=data_new, messenger=messenger, args=args)
+                
                 if fm_new_output is None and args.linear_probe_fm_new_unfreeze_fm and args.fm_new == 'hubertecg': # hubertecg have layer drop during training, we skip these batches
                     continue
                 # Prepare the features from FM for input to the linear prober
@@ -1064,7 +1124,7 @@ def main(args):
                     fm_new_output = torch.mean(fm_new_output, dim=tuple(probe_dims_to_reduce))
                 elif args.linear_probe_input_dim_reduction is None:
                     fm_new_output = fm_new_output.view(current_batch_size, -1)
-                
+
                 # Forward with the linear prober
                 class_prediction = linear_prober(fm_new_output)
                 loss_probe = prober_criterion(class_prediction, target)
@@ -1074,7 +1134,7 @@ def main(args):
                 prober_optimizer.step()
 
                 # Record loss
-                mlflow.log_metric("loss_probe_iter", loss_probe.item(), step=e*len(data_loader_train)+step)
+                #mlflow.log_metric("loss_probe_iter", loss_probe.item(), step=e*len(data_loader_train)+step)
 
                 # Optional testrun debug
                 if args.debug_run and step == 2:
@@ -1083,17 +1143,20 @@ def main(args):
             # Evaluate to check bridge performance
             if (e+1) % args.evaluate_every == 0:
                 fm_old.eval()
+                print("Model training mode 3:", fm_old.training)
                 fm_new.eval()
+                print("Model training mode 4:", fm_new.training)
                 with torch.no_grad():
                     linear_prober.eval()
+                    print("Model training mode 5:", linear_prober.training)
                     stats = evaluate_bridge(args=args, data_loader=data_loader_train, bridge_criterion=prober_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=None, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='train', step=e)
+                 #   log_mlflow(args=args, stats=stats, split='train', step=e)
                     print(f"Model at epoch {e} on train set: Accuracy {stats['accuracy']}")
                     stats = evaluate_bridge(args=args, data_loader=data_loader_val, bridge_criterion=prober_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=None, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='val', step=e)
+                  #  log_mlflow(args=args, stats=stats, split='val', step=e)
                     print(f"Model at epoch {e} on val set: Accuracy {stats['accuracy']}")
                     stats = evaluate_bridge(args=args, data_loader=data_loader_test, bridge_criterion=prober_criterion, fm_old=fm_old, fm_new=fm_new, bridge_model=None, messenger=messenger, device=device, ch_names=None, metrics=args.metrics, is_binary=(args.nb_classes == 1), linear_prober=linear_prober)
-                    log_mlflow(args=args, stats=stats, split='test', step=e)
+                    #log_mlflow(args=args, stats=stats, split='test', step=e)
                     print(f"Model at epoch {e} on test set: Accuracy {stats['accuracy']}")
                         
                     print(f'Model trained for {e} epoch')
@@ -1110,12 +1173,12 @@ def main(args):
                     torch.save(fm_new.state_dict(), checkpoint_path)
                 elif args.fm_new in ['ecgfm']:
                     # Save FM weights
-                    checkpoint = torch.load(args.fm_new_checkpoint)
+                    checkpoint = load_checkpoint(args.fm_new_checkpoint, device)
                     checkpoint['model'] = fm_new.state_dict()
                     torch.save(checkpoint, checkpoint_path)
                 elif args.fm_new in ['hubertecg', 'hubertecgb', 'hubertecgl']:
                     # Save FM weights
-                    checkpoint = torch.load(args.fm_new_checkpoint)
+                    checkpoint = load_checkpoint(args.fm_new_checkpoint, device)
                     checkpoint['model_state_dict'] = fm_new.state_dict()
                     torch.save(checkpoint, checkpoint_path)
                 elif args.fm_new in ['ecgdualnet']:
@@ -1126,7 +1189,7 @@ def main(args):
                         }
                     torch.save(to_save, checkpoint_path)
                 elif args.fm_new in ['normwear']:
-                    checkpoint = torch.load(args.fm_new_checkpoint)
+                    checkpoint = load_checkpoint(args.fm_new_checkpoint, device)
                     checkpoint['model'] = fm_new.state_dict()
                     torch.save(checkpoint, checkpoint_path)
 
@@ -1266,7 +1329,6 @@ def main(args):
             target = target.to(device, non_blocking=True)
             data_new = eval(f"{args.fm_new}_data_prepare")(args=args, device=device, data=data_new)
             data_old = eval(f"{args.fm_old}_data_prepare")(args=args, device=device, data=data_old)
-
             # Loop through bridge_inputs
             for fm_layer in range(max(fm_config[args.fm_old][1], fm_config[args.fm_new][1])):
                 if fm_layer <= fm_config[args.fm_old][1]-1:
@@ -1285,7 +1347,6 @@ def main(args):
                 # Forward for FMs
                 with torch.no_grad():
                     fm_old_input, fm_new_output, fm_old_lastlayer_output = fm_forward(fm_old=fm_old, fm_new=fm_new, data_old=data_old, data_new=data_new, messenger=messenger, args=args)
-                
                 # Prepare the features from FM for input to the linear prober
                 if args.linear_probe_input_dim_reduction in ['mean']:    
                     if step == 0: # only calculate the dimension to reduce at the first step
@@ -1296,7 +1357,6 @@ def main(args):
                 
                 # Forward with the linear prober
                 class_prediction = linear_prober(fm_old_lastlayer_output)
-                
                 # Reduce the fm_old feature as well
                 if step == 0 and fm_layer == 0: # only calculate the dimension to reduce at the first step
                     assert len(fm_old_input.shape) == len(set(fm_old_input.shape)), f"fm_old_input shape dimensions are not unique: {fm_old_input.shape}"
@@ -1350,15 +1410,15 @@ def main(args):
             print(key, concatenated.shape)
     
     # End mlflow logger
-    mlflow.end_run()
+   # mlflow.end_run()
 
 if __name__ == '__main__':
     # Read arguments
     opts = get_args()
     if opts.experiment_number:
-        opts.output_dir = f'/data/anonymous/BioX-Bridge/checkpoints_{opts.experiment_name}/experiment_{str(opts.experiment_number).zfill(3)}'
+        opts.output_dir = f'checkpoints_{opts.experiment_name}/experiment_{str(opts.experiment_number).zfill(3)}'
         Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
-        opts.log_dir = f'/users/anonymous/BioX-Bridge/checkpoints_{opts.experiment_name}/experiment_{str(opts.experiment_number).zfill(3)}'
+        opts.log_dir = f'checkpoints_{opts.experiment_name}/experiment_{str(opts.experiment_number).zfill(3)}'
         Path(opts.log_dir).mkdir(parents=True, exist_ok=True)
 
     # Initialize the print_output.txt and redirect all prints to the text file, will be restored to stdout later
@@ -1376,10 +1436,12 @@ if __name__ == '__main__':
     main(opts)
 
     # Print peak vram usage
-    peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
-    print(f"Peak VRAM usage: {peak:.2f} GB")
 
-    # Track end time
+   
+   #     peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    #    print(f"Peak VRAM usage: {peak:.2f} GB")
+
+    # Track end times
     endtime = datetime.datetime.now()
     print(f'End time: {endtime}')
     print(f'Experiment run duration: {str(endtime-starttime)}')

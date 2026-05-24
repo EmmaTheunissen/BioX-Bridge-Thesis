@@ -32,7 +32,11 @@ from torch.utils.tensorboard import SummaryWriter
 # from LaBraM_anonymous.data_processor.dataset import ShockDataset
 import pickle
 from scipy.signal import resample
-from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
+try:
+    from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
+except ImportError:
+    binary_metrics_fn = None
+    multiclass_metrics_fn = None
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_squared_error

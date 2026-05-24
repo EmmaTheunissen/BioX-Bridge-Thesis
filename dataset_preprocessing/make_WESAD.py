@@ -297,7 +297,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Configuration for Processing")
     parser.add_argument("--wesad_path", type=str, default="/data/anonymous/WESAD", help="Path to the WESAD dataset")
     parser.add_argument("--splits", type=dict, default={"train": 5, "val": 2, "pair": 5, "test": 3}, help="Number of subjects for each split")
-    parser.add_argument("--ecgfm", type=str, default='ecgdualnet', choices=['ecgfm', 'hubertecg', 'ecgdualnet'])
+    parser.add_argument("--ecgfm", type=str, default='hubertecg', choices=['ecgfm', 'hubertecg', 'ecgdualnet'])
     parser.add_argument("--ppgfm", type=str, default='papagei', choices=['papagei'])
     parser.add_argument("--segment_length", type=int, default=60, help='Length of each segment in seconds')
     parser.add_argument("--step_size", type=int, default=5, help='Step size between adjacent segments in seconds')
